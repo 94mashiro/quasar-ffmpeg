@@ -226,6 +226,7 @@ External library support:
   --enable-libcdio         enable audio CD grabbing with libcdio [no]
   --enable-libcodec2       enable codec2 en/decoding using libcodec2 [no]
   --enable-libdav1d        enable AV1 decoding via libdav1d [no]
+  --enable-libdovi         enable explicit native DV Profile 7 conversion [no]
   --enable-libdavs2        enable AVS2 decoding via libdavs2 [no]
   --enable-libdc1394       enable IIDC-1394 grabbing using libdc1394
                            and libraw1394 [no]
@@ -2083,6 +2084,7 @@ EXTERNAL_LIBRARY_LIST="
     libcaca
     libcodec2
     libdav1d
+    libdovi
     libdc1394
     libflite
     libfontconfig
@@ -3466,6 +3468,7 @@ hevc_vdpau_hwaccel_deps="vdpau VdpPictureInfoHEVC"
 hevc_vdpau_hwaccel_select="hevc_decoder"
 hevc_videotoolbox_hwaccel_deps="videotoolbox"
 hevc_videotoolbox_hwaccel_select="hevc_decoder"
+hevc_videotoolbox_hwaccel_suggest="libdovi"
 hevc_vulkan_hwaccel_deps="vulkan"
 hevc_vulkan_hwaccel_select="hevc_decoder"
 mjpeg_nvdec_hwaccel_deps="nvdec"
@@ -7331,6 +7334,7 @@ enabled libbluray         && require_pkg_config libbluray libbluray libbluray/bl
 enabled libbs2b           && require_pkg_config libbs2b libbs2b bs2b.h bs2b_open
 enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
 enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
+enabled libdovi           && require_pkg_config libdovi "dovi >= 3.3.2" libdovi/rpu_parser.h dovi_convert_rpu_with_mode
 enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 1.0.0" "dav1d/dav1d.h" dav1d_version
 enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
 enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new

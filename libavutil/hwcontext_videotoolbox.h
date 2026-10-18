@@ -42,6 +42,11 @@ typedef struct AVVTDeviceContext {
      * decoder init/open. Leave zero for shader consumers, including
      * libplacebo's own DV reshape. */
     int enable_native_dolby_vision;
+    /** Lossy P7 -> P8.1, libdovi mode 2: drop enhancement layer, reset
+     * luma/chroma mapping. Requires enable_native_dolby_vision, libdovi,
+     * HDR10-compatible P7 base. Set before decoder init. Default zero rejects
+     * P7. */
+    int convert_native_dolby_vision_profile7;
 } AVVTDeviceContext;
 
 typedef struct AVVTFramesContext {
