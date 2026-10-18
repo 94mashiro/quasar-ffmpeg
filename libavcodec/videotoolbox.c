@@ -36,6 +36,8 @@
 #include "libavutil/pixdesc.h"
 #include "bytestream.h"
 #include "decode.h"
+#include "dovi_rpu.h"
+#include "golomb.h"
 #include "internal.h"
 #include "h264dec.h"
 #include "hevc/hevcdec.h"
@@ -892,9 +894,11 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
     case 5:
         return dovi->dv_md_compression == AV_DOVI_COMPRESSION_NONE;
     case 8:
-        /* Native HDR bases: known HDR10/HLG only. */
-        return dovi->dv_bl_signal_compatibility_id == 1 ||
-               dovi->dv_bl_signal_compatibility_id == 4;
+        /* Native HDR bases: known HDR10/HLG only. Compressed metadata is
+         * submitted as standalone RPUs; see videotoolbox_hevc_append_dovi_rpus. */
+        return dovi->dv_md_compression != AV_DOVI_COMPRESSION_RESERVED &&
+               (dovi->dv_bl_signal_compatibility_id == 1 ||
+                dovi->dv_bl_signal_compatibility_id == 4);
     default:
         return 0;
     }
@@ -965,6 +969,21 @@ static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
                               kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
     else
         CVBufferRemoveAttachment(pixbuf, CFSTR("MPVUI.NativeDolbyVisionProfile7To81"));
+    // Frame-owned effective session configuration survives decode reordering.
+    // This describes the configured native decoder, not an inferred TV signal.
+    const CFStringRef keys[] = {CFSTR("MPVUI.NativeDolbyVisionSessionProfile"),
+                               CFSTR("MPVUI.NativeDolbyVisionSessionCompatibility")};
+    int values[] = {dovi ? dovi->dv_profile : -1,
+                    dovi ? dovi->dv_bl_signal_compatibility_id : -1};
+    for (int i = 0; i < 2; i++) {
+        CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &values[i]);
+        if (value) {
+            CVBufferSetAttachment(pixbuf, keys[i], value, kCVAttachmentMode_ShouldPropagate);
+            CFRelease(value);
+        } else {
+            CVBufferRemoveAttachment(pixbuf, keys[i]);
+        }
+    }
     if (!dovi || dovi->dv_profile != 8)
         return; // P5 is IPT; never tag ordinary BT.2020 YCbCr.
     CFStringRef transfer = dovi->dv_bl_signal_compatibility_id == 4 ?
@@ -997,8 +1016,9 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
             (!!dovi->el_present_flag) << 1 |
             !!dovi->bl_present_flag;
     AV_WB16(buf + 2, flags);
-    /* Compatible P8 metadata is uncompressed. Old TS descriptors may set
-     * reserved bits; omit these from dvvC. */
+    /* VideoToolbox rejects declared metadata compression, and submitted RPUs
+     * are always standalone. Old TS descriptors may set reserved bits; omit
+     * compression and reserved bits from dvvC. */
     buf[4] = (dovi->dv_bl_signal_compatibility_id & 0x0f) << 4;
 
     return CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
@@ -1137,6 +1157,17 @@ static int videotoolbox_start(AVCodecContext *avctx)
                        "(profile %u, compatibility %u).\n",
                        dovi->dv_profile, dovi->dv_bl_signal_compatibility_id);
             } else {
+                if (dovi) {
+                    // Residual-bearing P7 need not map to mpv's DOVI color
+                    // representation. Report the declared unsupported signal
+                    // here so the host cannot mistake an ordinary HEVC base
+                    // decode for native Dolby Vision preservation.
+                    av_log(avctx, AV_LOG_ERROR, "MPVUI_NATIVE_DOLBY_VISION_UNSUPPORTED: "
+                           "declared profile=%u compatibility=%u compression=%u "
+                           "cannot use the requested native Dolby Vision policy\n",
+                           dovi->dv_profile, dovi->dv_bl_signal_compatibility_id,
+                           dovi->dv_md_compression);
+                }
                 videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
             }
         }
@@ -1224,6 +1255,21 @@ static int videotoolbox_start(AVCodecContext *avctx)
                                           buf_attr,                  // destinationImageBufferAttributes
                                           &decoder_cb,               // outputCallback
                                           &videotoolbox->session);   // decompressionSessionOut
+
+    if (!status) {
+        const char *hardware = "unknown";
+        if (__builtin_available(macOS 10.9, iOS 17.0, tvOS 17.0, *)) {
+            CFTypeRef value = NULL;
+            OSStatus query = VTSessionCopyProperty(videotoolbox->session,
+                kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                kCFAllocatorDefault, &value);
+            if (!query && value && CFGetTypeID(value) == CFBooleanGetTypeID())
+                hardware = CFBooleanGetValue(value) ? "yes" : "no";
+            if (value) CFRelease(value);
+        }
+        av_log(avctx, AV_LOG_INFO, "MPVUI_VIDEOTOOLBOX_SESSION: hardware=%s native-dovi=%s\n",
+               hardware, videotoolbox_session_is_dovi(avctx) ? "yes" : "no");
+    }
 
     if (!status && videotoolbox_session_is_dovi(avctx)) {
         if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
@@ -1362,6 +1408,75 @@ static int videotoolbox_hevc_decode_params(AVCodecContext *avctx,
     return videotoolbox_common_decode_slice(avctx, buffer, size);
 }
 
+// FFmpeg's validated side data must describe these exact current bytes.
+// Shared by original passthrough and opt-in conversion. Never edit originals.
+static int videotoolbox_dovi_rpu_matches(const AVFrameSideData *validated,
+                                         const uint8_t *buffer, size_t size)
+{
+    return buffer && size > 2 && validated && validated->data &&
+           validated->size == size - 2 &&
+           !memcmp(validated->data, buffer + 2, size - 2);
+}
+
+/* Whether an RPU reuses a previous RPU's mapping or omits static DM
+ * metadata. Unrecognized syntax is left to FFmpeg's validated passthrough. */
+static int videotoolbox_dovi_rpu_is_compressed(const H2645NAL *nal)
+{
+    GetBitContext gb;
+    int rpu_format, dm_compression;
+    if (nal->size <= 3 || nal->data[2] != 25 ||
+        init_get_bits8(&gb, nal->data + 3, nal->size - 3) < 0 ||
+        get_bits(&gb, 6) != 2)
+        return 0;
+    rpu_format = get_bits(&gb, 11);
+    skip_bits(&gb, 8); // vdr_rpu_profile, vdr_rpu_level
+    if (!get_bits1(&gb) || (rpu_format & 0x700))
+        return 0;
+    skip_bits1(&gb); // chroma_resampling_explicit_filter_flag
+    if (!get_bits(&gb, 2)) // fixed-point coefficient_data_type
+        get_ue_golomb_long(&gb);
+    skip_bits(&gb, 3); // vdr_rpu_normalized_idc, bl_video_full_range_flag
+    for (int i = 0; i < 3; i++)
+        get_ue_golomb_long(&gb); // BL, EL/ext mapping and VDR bit depths
+    skip_bits1(&gb); // spatial_resampling_filter_flag
+    dm_compression = get_bits(&gb, 3);
+    skip_bits(&gb, 3); // EL resampling, disable_residual, vdr_dm_metadata_present
+    return get_bits_left(&gb) > 0 && (dm_compression || get_bits1(&gb));
+}
+
+/* Serialize the frame's decoded metadata as one standalone RPU. The HEVC
+ * decoder has already resolved previous-RPU and static DM references. */
+static int videotoolbox_hevc_append_expanded_dovi_rpu(AVCodecContext *avctx,
+                                                      const H2645NAL *nal)
+{
+    HEVCContext *h = avctx->priv_data;
+    const AVFrameSideData *metadata = av_frame_get_side_data(
+        h->cur_frame->f, AV_FRAME_DATA_DOVI_METADATA);
+    const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+    DOVIContext writer = { .logctx = avctx };
+    uint8_t *rpu = NULL, *unit = NULL;
+    int rpu_size = 0, ret;
+    if (!metadata || !dovi)
+        return AVERROR_INVALIDDATA;
+    writer.cfg = *dovi;
+    writer.cfg.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
+    ret = ff_dovi_rpu_generate(&writer, (const AVDOVIMetadata *)metadata->data,
+                               FF_DOVI_WRAP_NAL, &rpu, &rpu_size);
+    ff_dovi_ctx_unref(&writer);
+    if (ret >= 0 && (!rpu || rpu_size <= 0))
+        ret = AVERROR_INVALIDDATA;
+    if (ret >= 0 && !(unit = av_malloc(rpu_size + 2)))
+        ret = AVERROR(ENOMEM);
+    if (ret >= 0) {
+        memcpy(unit, nal->raw_data, 2); // UNSPEC62 NAL header
+        memcpy(unit + 2, rpu, rpu_size);
+        ret = videotoolbox_common_decode_slice(avctx, unit, rpu_size + 2);
+    }
+    av_free(unit);
+    av_free(rpu);
+    return ret;
+}
+
 #if CONFIG_LIBDOVI
 /* Append only complete, validated P8.1 RPU. libdovi mode 2 also accepts
  * P5/P8; verify bitstream source profile independently of container before
@@ -1376,8 +1491,7 @@ static int videotoolbox_hevc_append_converted_p7_rpu(AVCodecContext *avctx,
     // and stale metadata.
     const AVFrameSideData *validated = av_frame_get_side_data(
         h->cur_frame->f, AV_FRAME_DATA_DOVI_RPU_BUFFER);
-    if (!buffer || size <= 2 || !validated || validated->size != size - 2 ||
-        memcmp(validated->data, buffer + 2, size - 2))
+    if (!videotoolbox_dovi_rpu_matches(validated, buffer, size))
         return AVERROR_INVALIDDATA;
     DoviRpuOpaque *rpu = dovi_parse_unspec62_nalu(buffer, size);
     if (!rpu)
@@ -1428,13 +1542,13 @@ static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
         H2645NAL *nal = &h->pkt.nals[i];
         if (nal->type != HEVC_NAL_UNSPEC62)
             continue;
-        if (nal->raw_size <= 2) {
-            if (convert_p7)
-                return AVERROR_INVALIDDATA;
-            continue;
-        }
+        const AVFrameSideData *validated = av_frame_get_side_data(
+            h->cur_frame->f, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+        if (nal->raw_size <= 2 || !videotoolbox_dovi_rpu_matches(
+                validated, nal->raw_data, nal->raw_size))
+            return AVERROR_INVALIDDATA;
         rpu_count++;
-        if (convert_p7 && rpu_count != 1)
+        if (rpu_count != 1)
             return AVERROR_INVALIDDATA;
         int ret;
 #if CONFIG_LIBDOVI
@@ -1442,11 +1556,14 @@ static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
             ret = videotoolbox_hevc_append_converted_p7_rpu(avctx, nal->raw_data, nal->raw_size);
         else
 #endif
+        if (videotoolbox_dovi_rpu_is_compressed(nal))
+            ret = videotoolbox_hevc_append_expanded_dovi_rpu(avctx, nal);
+        else
             ret = videotoolbox_common_decode_slice(avctx, nal->raw_data, nal->raw_size);
         if (ret < 0)
             return ret; // Never submit stripped native DV sample.
     }
-    return convert_p7 && rpu_count != 1 ? AVERROR_INVALIDDATA : 0;
+    return rpu_count != 1 ? AVERROR_INVALIDDATA : 0;
 }
 
 static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
@@ -1457,6 +1574,11 @@ static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
     int ret;
 
     ret = videotoolbox_hevc_append_dovi_rpus(avctx);
+    if (ret < 0 && !vtctx->native_dovi_error_reported) {
+        av_log(avctx, AV_LOG_ERROR, "MPVUI_NATIVE_DOLBY_VISION_UNSUPPORTED: "
+               "missing, malformed, duplicate, or unconvertible current-frame RPU\n");
+        vtctx->native_dovi_error_reported = true;
+    }
     if (ret >= 0)
         ret = ff_videotoolbox_common_end_frame(avctx, frame);
     vtctx->bitstream_size = 0;

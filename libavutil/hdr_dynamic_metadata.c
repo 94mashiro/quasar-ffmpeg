@@ -234,13 +234,77 @@ int av_dynamic_hdr_plus_from_t35(AVDynamicHDRPlus *s, const uint8_t *data,
     return 0;
 }
 
+// Validate before size calculation or array traversal. Side data can also be
+// supplied by filters and applications, not only by the bitstream parser.
+static int hdr_plus_rational_valid(AVRational q, int64_t scale, int64_t max)
+{
+    return q.den > 0 && q.num >= 0 &&
+           (int64_t)q.num * scale <= max * q.den;
+}
+
+static int hdr_plus_valid(const AVDynamicHDRPlus *s)
+{
+#define VALID(q, scale, max) hdr_plus_rational_valid((q), (scale), (max))
+    if (s->num_windows < 1 || s->num_windows > 3 ||
+        s->targeted_system_display_actual_peak_luminance_flag > 1 ||
+        s->mastering_display_actual_peak_luminance_flag > 1 ||
+        !VALID(s->targeted_system_display_maximum_luminance, 1, (1 << 27) - 1))
+        return 0;
+    for (int w = 0; w < s->num_windows; w++) {
+        const AVHDRPlusColorTransformParams *p = &s->params[w];
+        if (w && (!VALID(p->window_upper_left_corner_x, 1, 65535) ||
+                  !VALID(p->window_upper_left_corner_y, 1, 65535) ||
+                  !VALID(p->window_lower_right_corner_x, 1, 65535) ||
+                  !VALID(p->window_lower_right_corner_y, 1, 65535) ||
+                  p->overlap_process_option < 0 || p->overlap_process_option > 1))
+            return 0;
+        if (p->num_distribution_maxrgb_percentiles > 15 ||
+            p->tone_mapping_flag > 1 || p->color_saturation_mapping_flag > 1 ||
+            !VALID(p->average_maxrgb, 100000, 131071) ||
+            !VALID(p->fraction_bright_pixels, 1000, 1023))
+            return 0;
+        for (int i = 0; i < 3; i++)
+            if (!VALID(p->maxscl[i], 100000, 131071)) return 0;
+        for (int i = 0; i < p->num_distribution_maxrgb_percentiles; i++)
+            if (p->distribution_maxrgb[i].percentage > 127 ||
+                !VALID(p->distribution_maxrgb[i].percentile, 100000, 131071))
+                return 0;
+        if (p->tone_mapping_flag) {
+            if (p->num_bezier_curve_anchors > 15 ||
+                !VALID(p->knee_point_x, 4095, 4095) ||
+                !VALID(p->knee_point_y, 4095, 4095))
+                return 0;
+            for (int i = 0; i < p->num_bezier_curve_anchors; i++)
+                if (!VALID(p->bezier_curve_anchors[i], 1023, 1023)) return 0;
+        }
+        if (p->color_saturation_mapping_flag &&
+            !VALID(p->color_saturation_weight, 8, 63))
+            return 0;
+    }
+#define VALID_PEAK(name) do { \
+    if (s->name##_actual_peak_luminance_flag) { \
+        int rows = s->num_rows_##name##_actual_peak_luminance; \
+        int cols = s->num_cols_##name##_actual_peak_luminance; \
+        if (rows < 2 || rows > 25 || cols < 2 || cols > 25) return 0; \
+        for (int i = 0; i < rows; i++) \
+            for (int j = 0; j < cols; j++) \
+                if (!VALID(s->name##_actual_peak_luminance[i][j], 15, 15)) return 0; \
+    } \
+} while (0)
+    VALID_PEAK(targeted_system_display);
+    VALID_PEAK(mastering_display);
+#undef VALID_PEAK
+#undef VALID
+    return 1;
+}
+
 int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t *size)
 {
     uint8_t *buf;
     size_t size_bits, size_bytes;
     PutBitContext pbc, *pb = &pbc;
 
-    if (!s)
+    if (!s || !hdr_plus_valid(s))
         return AVERROR(EINVAL);
     if ((!data || *data) && !size)
        return AVERROR(EINVAL);
@@ -312,8 +376,8 @@ int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t
 
     init_put_bits(pb, buf, size_bytes);
 
-    // application_mode is set to Application Version 1
-    put_bits(pb, 8, 1);
+    // Preserve the decoded application version.
+    put_bits(pb, 8, s->application_version);
 
     // Payload as per CTA-861-H p.253-254
     put_bits(pb, 2, s->num_windows);
@@ -332,7 +396,7 @@ int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t
         put_bits(pb, 1, s->params[w].overlap_process_option);
     }
 
-    put_bits(pb, 27, s->targeted_system_display_maximum_luminance.num * luminance_den /
+    put_bits(pb, 27, (int64_t)s->targeted_system_display_maximum_luminance.num * luminance_den /
         s->targeted_system_display_maximum_luminance.den);
     put_bits(pb, 1, s->targeted_system_display_actual_peak_luminance_flag);
     if (s->targeted_system_display_actual_peak_luminance_flag) {
@@ -340,22 +404,22 @@ int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t
         put_bits(pb, 5, s->num_cols_targeted_system_display_actual_peak_luminance);
         for (int i = 0; i < s->num_rows_targeted_system_display_actual_peak_luminance; i++) {
             for (int j = 0; j < s->num_cols_targeted_system_display_actual_peak_luminance; j++)
-                put_bits(pb, 4, s->targeted_system_display_actual_peak_luminance[i][j].num * peak_luminance_den /
+                put_bits(pb, 4, (int64_t)s->targeted_system_display_actual_peak_luminance[i][j].num * peak_luminance_den /
                     s->targeted_system_display_actual_peak_luminance[i][j].den);
         }
     }
 
     for (int w = 0; w < s->num_windows; w++) {
         for (int i = 0; i < 3; i++)
-            put_bits(pb, 17, s->params[w].maxscl[i].num * rgb_den / s->params[w].maxscl[i].den);
-        put_bits(pb, 17, s->params[w].average_maxrgb.num * rgb_den / s->params[w].average_maxrgb.den);
+            put_bits(pb, 17, (int64_t)s->params[w].maxscl[i].num * rgb_den / s->params[w].maxscl[i].den);
+        put_bits(pb, 17, (int64_t)s->params[w].average_maxrgb.num * rgb_den / s->params[w].average_maxrgb.den);
         put_bits(pb, 4, s->params[w].num_distribution_maxrgb_percentiles);
         for (int i = 0; i < s->params[w].num_distribution_maxrgb_percentiles; i++) {
             put_bits(pb, 7, s->params[w].distribution_maxrgb[i].percentage);
-            put_bits(pb, 17, s->params[w].distribution_maxrgb[i].percentile.num * rgb_den /
+            put_bits(pb, 17, (int64_t)s->params[w].distribution_maxrgb[i].percentile.num * rgb_den /
                 s->params[w].distribution_maxrgb[i].percentile.den);
         }
-        put_bits(pb, 10, s->params[w].fraction_bright_pixels.num * fraction_pixel_den /
+        put_bits(pb, 10, (int64_t)s->params[w].fraction_bright_pixels.num * fraction_pixel_den /
             s->params[w].fraction_bright_pixels.den);
     }
 
@@ -365,7 +429,7 @@ int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t
         put_bits(pb, 5, s->num_cols_mastering_display_actual_peak_luminance);
         for (int i = 0; i < s->num_rows_mastering_display_actual_peak_luminance; i++) {
             for (int j = 0; j < s->num_cols_mastering_display_actual_peak_luminance; j++)
-                put_bits(pb, 4, s->mastering_display_actual_peak_luminance[i][j].num * peak_luminance_den /
+                put_bits(pb, 4, (int64_t)s->mastering_display_actual_peak_luminance[i][j].num * peak_luminance_den /
                     s->mastering_display_actual_peak_luminance[i][j].den);
         }
     }
@@ -373,17 +437,18 @@ int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t
     for (int w = 0; w < s->num_windows; w++) {
         put_bits(pb, 1, s->params[w].tone_mapping_flag);
         if (s->params[w].tone_mapping_flag) {
-            put_bits(pb, 12, s->params[w].knee_point_x.num * knee_point_den / s->params[w].knee_point_x.den);
-            put_bits(pb, 12, s->params[w].knee_point_y.num * knee_point_den / s->params[w].knee_point_y.den);
+            put_bits(pb, 12, (int64_t)s->params[w].knee_point_x.num * knee_point_den / s->params[w].knee_point_x.den);
+            put_bits(pb, 12, (int64_t)s->params[w].knee_point_y.num * knee_point_den / s->params[w].knee_point_y.den);
             put_bits(pb, 4, s->params[w].num_bezier_curve_anchors);
             for (int i = 0; i < s->params[w].num_bezier_curve_anchors; i++)
-                put_bits(pb, 10, s->params[w].bezier_curve_anchors[i].num * bezier_anchor_den /
+                put_bits(pb, 10, (int64_t)s->params[w].bezier_curve_anchors[i].num * bezier_anchor_den /
                     s->params[w].bezier_curve_anchors[i].den);
-            put_bits(pb, 1, s->params[w].color_saturation_mapping_flag);
-            if (s->params[w].color_saturation_mapping_flag)
-                put_bits(pb, 6, s->params[w].color_saturation_weight.num * saturation_weight_den /
-                    s->params[w].color_saturation_weight.den);
         }
+        // Saturation mapping is independent of tone mapping (ST 2094-40).
+        put_bits(pb, 1, s->params[w].color_saturation_mapping_flag);
+        if (s->params[w].color_saturation_mapping_flag)
+            put_bits(pb, 6, (int64_t)s->params[w].color_saturation_weight.num * saturation_weight_den /
+                s->params[w].color_saturation_weight.den);
     }
 
     flush_put_bits(pb);

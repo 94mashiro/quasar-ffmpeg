@@ -357,7 +357,7 @@ int av_dynamic_hdr_plus_from_t35(AVDynamicHDRPlus *s, const uint8_t *data,
 
 /**
  * Serialize dynamic HDR10+ metadata to a user data registered ITU-T T.35 buffer,
- * excluding the first 48 bytes of the header, and beginning with the application mode.
+ * excluding the first 48 bits of the header, and beginning with the application mode.
  * @param s A pointer containing the decoded AVDynamicHDRPlus structure.
  * @param[in,out] data A pointer to pointer to a byte buffer to be filled with the
  *                     serialized metadata.

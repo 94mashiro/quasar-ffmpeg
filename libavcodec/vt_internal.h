@@ -45,6 +45,7 @@ typedef struct VTContext {
     // Current H264 parameters (used to trigger decoder restart on SPS changes).
     uint8_t                     sps[3];
     bool                        reconfig_needed;
+    bool                        native_dovi_error_reported;
 
     void *logctx;
 } VTContext;
