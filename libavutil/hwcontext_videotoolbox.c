@@ -841,6 +841,7 @@ const HWContextType ff_hwcontext_type_videotoolbox = {
     .type                 = AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
     .name                 = "videotoolbox",
 
+    .device_hwctx_size    = sizeof(AVVTDeviceContext),
     .frames_hwctx_size    = sizeof(VTFramesContext),
 
     .device_create        = vt_device_create,

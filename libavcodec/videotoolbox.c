@@ -25,6 +25,7 @@
 #include "videotoolbox.h"
 #include "libavutil/attributes.h"
 #include "libavutil/hwcontext_videotoolbox.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/mem.h"
 #include "vt_internal.h"
 #include "libavutil/avutil.h"
@@ -64,9 +65,14 @@ enum { kCMVideoCodecType_AV1 = 'av01' };
 
 #define VIDEOTOOLBOX_ESDS_EXTRADATA_PADDING  12
 
+enum { kCMVideoCodecType_DolbyVisionHEVC_FF = 'dvh1' };
+
 typedef struct VTHWFrame {
     CVPixelBufferRef pixbuf;
     AVBufferRef *hw_frames_ctx;
+    // Carry decoding worker's session identity through frame-thread
+    // handoff; post_process gets caller context.
+    int native_dovi;
 } VTHWFrame;
 
 static void videotoolbox_buffer_release(void *opaque, uint8_t *data)
@@ -118,6 +124,10 @@ int ff_videotoolbox_buffer_append(VTContext *vtctx,
     return 0;
 }
 
+static int videotoolbox_session_is_dovi(AVCodecContext *avctx);
+static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
+                                                     CVPixelBufferRef pixbuf);
+
 static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
 {
     int ret;
@@ -134,7 +144,8 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
     frame->crop_top = 0;
     frame->crop_bottom = 0;
 
-    if ((ret = av_vt_pixbuf_set_attachments(avctx, ref->pixbuf, frame)) < 0)
+    if (!ref->native_dovi &&
+        (ret = av_vt_pixbuf_set_attachments(avctx, ref->pixbuf, frame)) < 0)
         return ret;
 
     frame->data[3] = (uint8_t*)ref->pixbuf;
@@ -564,6 +575,9 @@ static int videotoolbox_buffer_create(AVCodecContext *avctx, AVFrame *frame)
     if (ref->pixbuf)
         CVPixelBufferRelease(ref->pixbuf);
     ref->pixbuf = vtctx->frame;
+    ref->native_dovi = videotoolbox_session_is_dovi(avctx);
+    if (ref->native_dovi)
+        videotoolbox_dovi_tag_output_attachments(avctx, ref->pixbuf);
     vtctx->frame = NULL;
 
     // Old API code path.
@@ -679,9 +693,11 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
     OSStatus status;
     CMBlockBufferRef  block_buf;
     CMSampleBufferRef sample_buf;
+    size_t sample_size;
 
     block_buf  = NULL;
     sample_buf = NULL;
+    sample_size = size;
 
     status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,// structureAllocator
                                                 buffer,             // memoryBlock
@@ -703,8 +719,8 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
                                       1,                    // numSamples
                                       0,                    // numSampleTimingEntries
                                       NULL,                 // sampleTimingArray
-                                      0,                    // numSampleSizeEntries
-                                      NULL,                 // sampleSizeArray
+                                      CMFormatDescriptionGetMediaSubType(fmt_desc) == kCMVideoCodecType_DolbyVisionHEVC_FF ? 1 : 0,
+                                      CMFormatDescriptionGetMediaSubType(fmt_desc) == kCMVideoCodecType_DolbyVisionHEVC_FF ? &sample_size : NULL,
                                       &sample_buf);
     }
 
@@ -834,11 +850,116 @@ static CFDictionaryRef videotoolbox_buffer_attributes_create(int width,
     return buffer_attributes;
 }
 
+/* Native DV opt-in: AVFoundation VO devices only. Metal/libplacebo retain
+ * upstream HEVC behavior. */
+static int videotoolbox_native_dovi_enabled(AVCodecContext *avctx)
+{
+    AVHWDeviceContext *device = NULL;
+    if (avctx->hw_frames_ctx) {
+        AVHWFramesContext *frames = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
+        device = frames->device_ctx;
+    } else if (avctx->hw_device_ctx) {
+        device = (AVHWDeviceContext *)avctx->hw_device_ctx->data;
+    }
+    return device && device->type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX &&
+           device->hwctx &&
+           ((AVVTDeviceContext *)device->hwctx)->enable_native_dolby_vision;
+}
+
+static const AVDOVIDecoderConfigurationRecord *videotoolbox_dovi_get_conf(AVCodecContext *avctx)
+{
+    if (!videotoolbox_native_dovi_enabled(avctx))
+        return NULL;
+    const AVPacketSideData *sd = ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
+
+    if (!sd || sd->size < sizeof(AVDOVIDecoderConfigurationRecord))
+        return NULL;
+
+    return (const AVDOVIDecoderConfigurationRecord *)sd->data;
+}
+
+static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    if (!dovi || !dovi->rpu_present_flag || !dovi->bl_present_flag ||
+        dovi->el_present_flag)
+        return 0;
+
+    /* Native P7 decode requires P8.1 conversion. */
+    switch (dovi->dv_profile) {
+    case 5:
+        return dovi->dv_md_compression == AV_DOVI_COMPRESSION_NONE;
+    case 8:
+        /* Native HDR bases: known HDR10/HLG only. */
+        return dovi->dv_bl_signal_compatibility_id == 1 ||
+               dovi->dv_bl_signal_compatibility_id == 4;
+    default:
+        return 0;
+    }
+}
+
+static int videotoolbox_session_is_dovi(AVCodecContext *avctx)
+{
+    AVVideotoolboxContext *context = videotoolbox_get_context(avctx);
+    return videotoolbox_native_dovi_enabled(avctx) && context &&
+           context->cm_codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF;
+}
+
+static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
+                                                     CVPixelBufferRef pixbuf)
+{
+    const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+    if (!videotoolbox_session_is_dovi(avctx))
+        return;
+    /* Session identity alone cannot prove valid DV. VO also needs VideoToolbox's
+     * actual RPU attachment. */
+    CVBufferSetAttachment(pixbuf, CFSTR("MPVUI.NativeDolbyVisionSession"),
+                          kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+    if (!dovi || dovi->dv_profile != 8)
+        return; // P5 is IPT; never tag ordinary BT.2020 YCbCr.
+    CFStringRef transfer = dovi->dv_bl_signal_compatibility_id == 4 ?
+        kCVImageBufferTransferFunction_ITU_R_2100_HLG :
+        kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
+    if (!CVBufferGetAttachment(pixbuf, kCVImageBufferColorPrimariesKey, NULL))
+        CVBufferSetAttachment(pixbuf, kCVImageBufferColorPrimariesKey,
+                              kCVImageBufferColorPrimaries_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+    if (!CVBufferGetAttachment(pixbuf, kCVImageBufferTransferFunctionKey, NULL))
+        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
+                              transfer, kCVAttachmentMode_ShouldPropagate);
+    if (!CVBufferGetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey, NULL))
+        CVBufferSetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+}
+
+static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    uint8_t buf[24] = { 0 };
+    uint16_t flags;
+
+    if (!videotoolbox_dovi_is_apple_hevc(dovi))
+        return NULL;
+
+    buf[0] = dovi->dv_version_major;
+    buf[1] = dovi->dv_version_minor;
+    flags = (dovi->dv_profile & 0x7f) << 9 |
+            (dovi->dv_level & 0x3f) << 3 |
+            (!!dovi->rpu_present_flag) << 2 |
+            (!!dovi->el_present_flag) << 1 |
+            !!dovi->bl_present_flag;
+    AV_WB16(buf + 2, flags);
+    /* Compatible P8 metadata is uncompressed. Old TS descriptors may set
+     * reserved bits; omit these from dvvC. */
+    buf[4] = (dovi->dv_bl_signal_compatibility_id & 0x0f) << 4;
+
+    return CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
+}
+
 static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec_type,
                                                           AVCodecContext *avctx)
 {
     CFMutableDictionaryRef avc_info;
     CFDataRef data = NULL;
+    CFDataRef dovi_data = NULL;
+    const AVDOVIDecoderConfigurationRecord *dovi = NULL;
 
     CFMutableDictionaryRef config_info = CFDictionaryCreateMutable(kCFAllocatorDefault,
                                                                    0,
@@ -853,6 +974,20 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
                             kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
                             kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                          kCFBooleanTrue);
+
+    if (codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF) {
+        dovi = videotoolbox_dovi_get_conf(avctx);
+        if (dovi && dovi->dv_profile == 8) {
+            CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_ColorPrimaries,
+                                 kCMFormatDescriptionColorPrimaries_ITU_R_2020);
+            CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_TransferFunction,
+                                 dovi->dv_bl_signal_compatibility_id == 4 ?
+                                    kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG :
+                                    kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ);
+            CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_YCbCrMatrix,
+                                 kCMFormatDescriptionYCbCrMatrix_ITU_R_2020);
+        }
+    }
 
     avc_info = CFDictionaryCreateMutable(kCFAllocatorDefault,
                                          1,
@@ -871,10 +1006,17 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
         if (data)
             CFDictionarySetValue(avc_info, CFSTR("avcC"), data);
         break;
+    case kCMVideoCodecType_DolbyVisionHEVC_FF :
     case kCMVideoCodecType_HEVC :
         data = ff_videotoolbox_hvcc_extradata_create(avctx);
         if (data)
             CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
+        if (codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF) {
+            dovi = videotoolbox_dovi_get_conf(avctx);
+            dovi_data = videotoolbox_dovi_extradata_create(dovi);
+            if (dovi_data)
+                CFDictionarySetValue(avc_info, dovi->dv_profile > 7 ? CFSTR("dvvC") : CFSTR("dvcC"), dovi_data);
+        }
         break;
 #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
     case kCMVideoCodecType_VP9 :
@@ -900,6 +1042,8 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
 
     if (data)
         CFRelease(data);
+    if (dovi_data)
+        CFRelease(dovi_data);
 
     CFRelease(avc_info);
     return config_info;
@@ -926,7 +1070,19 @@ static int videotoolbox_start(AVCodecContext *avctx)
         videotoolbox->cm_codec_type = kCMVideoCodecType_H264;
         break;
     case AV_CODEC_ID_HEVC :
-        videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
+        {
+            const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+
+            if (videotoolbox_dovi_is_apple_hevc(dovi)) {
+                videotoolbox->cm_codec_type = kCMVideoCodecType_DolbyVisionHEVC_FF;
+                av_log(avctx, AV_LOG_VERBOSE,
+                       "Using Dolby Vision HEVC VideoToolbox format "
+                       "(profile %u, compatibility %u).\n",
+                       dovi->dv_profile, dovi->dv_bl_signal_compatibility_id);
+            } else {
+                videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
+            }
+        }
         break;
     case AV_CODEC_ID_MPEG1VIDEO :
         videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
@@ -1011,6 +1167,19 @@ static int videotoolbox_start(AVCodecContext *avctx)
                                           buf_attr,                  // destinationImageBufferAttributes
                                           &decoder_cb,               // outputCallback
                                           &videotoolbox->session);   // decompressionSessionOut
+
+    if (!status && videotoolbox_session_is_dovi(avctx)) {
+        if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            VTSessionSetProperty(videotoolbox->session,
+                                 kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                                 kCFBooleanTrue);
+        }
+        if (__builtin_available(macOS 14.0, iOS 17.0, tvOS 17.0, *)) {
+            VTSessionSetProperty(videotoolbox->session,
+                                 kVTDecompressionPropertyKey_GeneratePerFrameHDRDisplayMetadata,
+                                 kCFBooleanTrue);
+        }
+    }
 
     if (decoder_spec)
         CFRelease(decoder_spec);
@@ -1128,6 +1297,24 @@ static int videotoolbox_hevc_decode_params(AVCodecContext *avctx,
     return videotoolbox_common_decode_slice(avctx, buffer, size);
 }
 
+/* HEVC hwaccel forwards VCL/parameter NALs but omits suffix UNSPEC62 RPU.
+ * dvh1 description still needs per-frame RPU. */
+static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
+{
+    HEVCContext *h = avctx->priv_data;
+    if (!videotoolbox_session_is_dovi(avctx))
+        return 0;
+    for (int i = 0; i < h->pkt.nb_nals; i++) {
+        H2645NAL *nal = &h->pkt.nals[i];
+        if (nal->type != HEVC_NAL_UNSPEC62 || nal->raw_size <= 2)
+            continue;
+        int ret = videotoolbox_common_decode_slice(avctx, nal->raw_data, nal->raw_size);
+        if (ret < 0)
+            return ret; // Never submit stripped native DV sample.
+    }
+    return 0;
+}
+
 static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
 {
     HEVCContext *h = avctx->priv_data;
@@ -1135,7 +1322,9 @@ static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
     VTContext *vtctx = avctx->internal->hwaccel_priv_data;
     int ret;
 
-    ret = ff_videotoolbox_common_end_frame(avctx, frame);
+    ret = videotoolbox_hevc_append_dovi_rpus(avctx);
+    if (ret >= 0)
+        ret = ff_videotoolbox_common_end_frame(avctx, frame);
     vtctx->bitstream_size = 0;
     return ret;
 }

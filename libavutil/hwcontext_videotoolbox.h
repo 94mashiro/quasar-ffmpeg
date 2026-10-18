@@ -28,19 +28,21 @@
 
 /**
  * @file
- * An API-specific header for AV_HWDEVICE_TYPE_VIDEOTOOLBOX.
  *
- * This API supports frame allocation using a native CVPixelBufferPool
- * instead of an AVBufferPool.
- *
- * If the API user sets a custom pool, AVHWFramesContext.pool must return
- * AVBufferRefs whose data pointer is a CVImageBufferRef or CVPixelBufferRef.
- * Note that the underlying CVPixelBuffer could be retained by OS frameworks
- * depending on application usage, so it is preferable to let CoreVideo manage
- * the pool using the default implementation.
- *
- * Currently AVHWDeviceContext.hwctx are always NULL.
+ * AV_HWDEVICE_TYPE_VIDEOTOOLBOX API. Allocate frames from native
+ * CVPixelBufferPool, not AVBufferPool. Custom AVHWFramesContext.pool must
+ * return AVBufferRefs pointing to CVImageBufferRef/CVPixelBufferRef. OS
+ * frameworks may retain buffers; prefer default CoreVideo pool management.
+ * AVHWDeviceContext.hwctx points to AVVTDeviceContext.
  */
+
+/** MPVUI extension; zero preserves upstream decoding. */
+typedef struct AVVTDeviceContext {
+    /** Native DV metadata for untouched AVFoundation output. Set before
+     * decoder init/open. Leave zero for shader consumers, including
+     * libplacebo's own DV reshape. */
+    int enable_native_dolby_vision;
+} AVVTDeviceContext;
 
 typedef struct AVVTFramesContext {
     enum AVColorRange color_range;
